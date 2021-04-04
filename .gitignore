@@ -1,0 +1,9 @@
+*.raw
+*.peaks
+*.pyc
+*.tar.gz
+*.swp
+*.swo
+.mailmap
+epochseconds
+__pycache__
