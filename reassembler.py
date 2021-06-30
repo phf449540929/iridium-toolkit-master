@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 # vim: set ts=4 sw=4 tw=0 et pm=:
 
 import sys
@@ -10,6 +10,7 @@ import struct
 import math
 import os
 import socket
+from copy import deepcopy
 
 verbose = False
 ifile = None
@@ -17,13 +18,16 @@ ofile = None
 mode = "undef"
 base_freq = 1616e6
 channel_width = 41667
+args = {}
 
-options, remainder = getopt.getopt(sys.argv[1:], 'vhi:o:m:', [
+options, remainder = getopt.getopt(sys.argv[1:], 'vhi:o:m:sa:', [
     'verbose',
     'help',
     'input=',
     'output=',
     'mode=',
+    'state',
+    'args=',
 ])
 
 for opt, arg in options:
@@ -35,11 +39,13 @@ for opt, arg in options:
         ofile = arg
     elif opt in ('-m', '--mode'):
         mode = arg
+    elif opt in ('-a', '--args'):
+        for a in arg.split(","):
+            args[a] = True
     elif opt in ('-h', '--help'):
-        print("Usage:", file=sys.stderr)
-        print("\t", os.path.basename(
-            sys.argv[0]), "[-v] [--input foo.parsed] --mode [ida|lap|sbd|page|msg|sat] [--output foo.parsed]",
-              file=sys.stderr)
+        print >> sys.stderr, "Usage:"
+        print >> sys.stderr, "\t", os.path.basename(
+            sys.argv[0]), "[-v] [--input foo.parsed] --mode [ida|lap|sbd|page|msg|sat] [--output foo.parsed]"
         exit(1)
     else:
         raise Exception("unknown argument?")
@@ -66,6 +72,17 @@ else:
     basename = re.sub('\.[^.]*$', '', ofile)
     outfile = open(ofile, "w")
 
+state = None
+if 'state' in args:
+    import pickle
+
+    statefile = "%s.state" % (mode)
+    try:
+        with open(statefile) as f:
+            state = pickle.load(f)
+    except (IOError, EOFError):
+        pass
+
 if verbose:
     print("ifile", ifile)
     print("ofile", ofile)
@@ -73,16 +90,43 @@ if verbose:
 
 
 class MyObject(object):
-    def fixtime(self):
-        if (self.name.startswith("j")):
-            return float(self.time)
-        try:
-            (crap, ts, fnord) = self.name.split("-", 3)
-            return (float(ts) + float(self.time) / 1000)
-        except ValueError:
-            return float(self.time) / 1000
+    def enrich(self):
+        if "|" in self.frequency:
+            chan, off = self.frequency.split('|')
+            self.frequency = base_freq + channel_width * int(chan) + int(off)
+        else:
+            self.frequency = int(self.frequency)
 
-    pass
+        if '-' in self.name:
+            self.starttime, _, self.attr = self.name[1 + self.name.index('-'):].partition('-')
+        else:
+            self.starttime = self.attr = ''
+
+        self.confidence = int(self.confidence.strip("%"))
+        self.mstime = float(self.mstime)
+
+        if '|' in self.level:
+            self.level, self.noise, self.snr = self.level.split('|')
+            self.snr = float(self.snr)
+            self.noise = float(self.noise)
+            self.level = float(self.level)
+        else:
+            self.snr = None
+            self.noise = None
+            try:
+                self.level = math.log(float(self.level), 10) * 20
+            except ValueError:
+                print >> sys.stderr, "Invalid signal level:", self.level
+                self.level = 0
+
+        if (self.name.startswith("j")):
+            self.time = self.mstime
+        else:
+            try:
+                # XXX: Does not handle really old time format.
+                self.time = float(self.starttime) + self.mstime / 1000
+            except ValueError:
+                self.time = self.mstime / 1000
 
 
 class Reassemble(object):
@@ -107,18 +151,10 @@ class Reassemble(object):
         self.stat_line += 1
         try:
             q = MyObject()
-            q.typ, q.name, q.time, q.frequency, q.confidence, q.level, q.symbols, q.uldl, q.data = line.split(None, 8)
-            if "|" in q.frequency:
-                chan, off = q.frequency.split('|')
-                q.frequency = base_freq + channel_width * int(chan) + int(off)
-            else:
-                q.frequency = int(q.frequency)
-            q.confidence = int(q.confidence.strip("%"))
-            q.time = float(q.time)
-            q.level = float(q.level)
+            q.typ, q.name, q.mstime, q.frequency, q.confidence, q.level, q.symbols, q.uldl, q.data = line.split(None, 8)
             return q
         except ValueError:
-            print("Couldn't parse input line: ", line, file=sys.stderr)
+            print >> sys.stderr, "Couldn't parse input line: ", line,
             return None
 
     def end(self):
@@ -126,9 +162,103 @@ class Reassemble(object):
             self.stat_filter, self.stat_line, 100.0 * self.stat_filter / self.stat_line))
 
 
-class ReassemblePPM(Reassemble):
-    qqq = None
+class StatsPKT(Reassemble):
+    intvl = 600
+    timeslot = None
+    default = None
+    stats = {}
+    first = True
+    loaded = False
 
+    def __init__(self):
+        if state is not None:
+            (self.timeslot, self.stats) = state
+            self.loaded = True
+            self.first = False
+        self.default = {}
+        for k in ['UL', 'DL']:
+            self.default[k] = {}
+            for x in ['IBC', 'IDA', 'IIP', 'IIQ', 'IIR', 'IIU', 'IMS', 'IRA', 'IRI', 'ISY', 'ITL', 'IU3', 'I36', 'I38',
+                      'MSG', 'VDA', 'VO6', 'VOC', 'VOD', 'MS3']:
+                self.default[k][x] = 0
+        pass
+
+    r1 = re.compile('UW:0-LCW:0-FIX:0')
+
+    def filter(self, line):
+        q = super(StatsPKT, self).filter(line)
+
+        if q == None: return None
+        if q.typ[3] != ":": return None
+        if q.typ == "RAW:": return None
+        if q.typ == "IME:": return None
+        if 'perfect' in args:
+            m = self.r1.match(q.attr)
+            if not m: return None
+
+        q.enrich()
+        return q
+
+    def process(self, q):
+        maptime = q.time - (q.time % self.intvl)
+        typ = q.typ[0:3]
+        rv = None
+
+        if maptime > self.timeslot:
+            # dump last time interval
+            if self.loaded:
+                print >> sys.stderr, "# Statefile (%s) not relevant to current file: %s" % (self.timeslot, maptime)
+                sys.exit(1)
+            if self.timeslot is not None:
+                if self.first:
+                    print >> sys.stderr, "# First period may be incomplete, skipping."
+                    self.first = False
+                    rv = [[self.timeslot, self.stats, True]]
+                else:
+                    rv = [[self.timeslot, self.stats, False]]
+            # reset for next slot
+            self.timeslot = maptime
+            self.stats = deepcopy(self.default)
+
+        self.loaded = False
+
+        if maptime == self.timeslot:
+            if typ not in self.stats['UL']:
+                print >> sys.stderr, "Unexpected frame %s found @ %s" % (typ, q.time)
+                pass
+            self.stats[q.uldl][typ] += 1
+        else:
+            print >> sys.stderr, "Time ordering violation: %f is before %f" % (q.time, self.timeslot)
+            sys.exit(1)
+        return rv
+
+    def printstats(self, timeslot, stats, skip=False):
+        ts = timeslot + self.intvl
+        comment = ''
+        if skip:
+            comment = '#!'
+            print >> sys.stderr, "#!@ %s L:" % (datetime.datetime.fromtimestamp(ts))
+        else:
+            print >> sys.stderr, "# @ %s L:" % (datetime.datetime.fromtimestamp(ts))
+        for k in stats:
+            for t in stats[k]:
+                print
+                "%siridium.parsed.%s.%s %7d %8d" % (comment, k, t, stats[k][t], ts)
+        sys.stdout.flush()
+
+    def consume(self, to):
+        (ts, stats, skip) = to
+        self.printstats(ts, stats, skip=skip)
+
+    def end(self):
+        if 'state' in args:
+            with open(statefile, 'w') as f:
+                state = pickle.dump([self.timeslot, self.stats], f)
+
+        self.printstats(self.timeslot, self.stats, skip=True)
+
+
+class ReassemblePPM(Reassemble):
     def __init__(self):
         pass
 
@@ -154,39 +284,71 @@ class ReassemblePPM(Reassemble):
         return q
 
     def process(self, q):
-        q.globaltime = q.fixtime()
-        q.uxtime = datetime.datetime.utcfromtimestamp(q.globaltime)
+        q.enrich()
+        q.uxtime = datetime.datetime.utcfromtimestamp(q.time)
 
         # correct for slot
         q.itime += datetime.timedelta(seconds=q.slot * (3 * float(8.28 + 0.1)) / 1000)
 
-        q.timediff = q.uxtime - q.itime  # missing correction for sat travel time
+        # XXX: missing correction for sat travel time
 
-        return [[q.timediff.total_seconds(), q.itime, q.starttime]]
+        return [[q.uxtime, q.itime, q.starttime]]
 
     ini = None
 
     def consume(self, data):
-        if self.ini is None:
+        if self.ini is None:  # First PKT
+            self.idx = 0
             self.ini = [data]
             self.fin = [data]
-            self.idx = 0
-        if data[2] != self.ini[self.idx][2]:
+            self.cur = data
+        if data[2] != self.ini[self.idx][2]:  # New Recording
             self.idx += 1
             self.ini.append(data)
             self.fin.append(data)
+            self.cur = data
         self.fin[-1] = data
+
+        # "interactive" statistics per INVTL(600)
+        if (data[1] - self.cur[1]).total_seconds() > 600:
+            (irun, toff, ppm) = self.onedelta(self.cur, data, verbose=False)
+            print
+            "@ %s: %.3f" % (data[1], ppm)
+            self.cur = data
+        elif (data[1] - self.cur[1]).total_seconds() < 0:
+            self.cur = data
+
+    def onedelta(self, start, end, verbose=False):
+        irun = (end[1] - start[1]).total_seconds()
+        urun = (end[0] - start[0]).total_seconds()
+        toff = urun - irun
+        ppm = toff / irun * 1000000
+        if verbose:
+            print
+            "Blob:"
+            print
+            "- Start Itime  : %s" % (start[1])
+            print
+            "- End   Itime  : %s" % (end[1])
+            print
+            "- Start Utime  : %s" % (start[0])
+            print
+            "- End   Utime  : %s" % (end[0])
+            print
+            "- Runtime      : %s" % (str(datetime.timedelta(seconds=int(irun))))
+            print
+            "- PPM          : %.3f" % (ppm)
+        return (irun, toff, ppm)
 
     def end(self):
         alltime = 0
         delta = 0
         for ppms in range(1 + self.idx):
-            td = (self.fin[ppms][1] - self.ini[ppms][1]).total_seconds()
-            toff = (self.fin[ppms][0] - self.ini[ppms][0])
-            ppm = toff / td * 1000000
-            alltime += td
+            (irun, toff, ppm) = self.onedelta(self.ini[ppms], self.fin[ppms], verbose=True)
+            alltime += irun
             delta += toff
-        print("rec.ppm %.3f" % (delta / alltime * 1000000))
+        print
+        "rec.ppm %.3f" % (delta / alltime * 1000000)
 
 
 class ReassembleIDA(Reassemble):
@@ -197,7 +359,6 @@ class ReassembleIDA(Reassemble):
         q = super(ReassembleIDA, self).filter(line)
         if q == None: return None
         if q.typ == "IDA:":
-            q.time = q.fixtime()
             qqq = re.compile('.* CRC:OK')
             if not qqq.match(q.data):
                 return
@@ -207,7 +368,7 @@ class ReassembleIDA(Reassemble):
             p = re.compile('.* cont=(\d) (\d) ctr=(\d+) \d+ len=(\d+) 0:.000 \[([0-9a-f.!]*)\]\s+..../.... CRC:OK')
             m = p.match(q.data)
             if (not m):
-                print("Couldn't parse IDA: ", q.data, file=sys.stderr)
+                print >> sys.stderr, "Couldn't parse IDA: ", q.data
             else:
                 q.ul = (q.uldl == 'UL')
                 q.f1 = m.group(1)
@@ -217,6 +378,7 @@ class ReassembleIDA(Reassemble):
                 q.data = m.group(5)
                 q.cont = (q.f1 == '1')
                 #                print "%s %s ctr:%02d %s"%(q.time,q.frequency,q.ctr,q.data)
+                q.enrich()
                 return q
 
     buf = []
@@ -234,7 +396,8 @@ class ReassembleIDA(Reassemble):
                 self.ofreq - 200) < m.frequency < (self.ofreq + 200):
             self.stat_dupes += 1
             if verbose:
-                print("dupe: ", m.time, "(", m.cont, m.ctr, ")", m.data)
+                print
+                "dupe: ", m.time, "(", m.cont, m.ctr, ")", m.data
             return
         self.otime = m.time
         self.odata = m.data
@@ -252,7 +415,8 @@ class ReassembleIDA(Reassemble):
                 else:
                     self.stat_ok += 1
                     if verbose:
-                        print(">assembled: [%s] %s" % (",".join(["%s" % x for x in time + [m.time]]), dat))
+                        print
+                        ">assembled: [%s] %s" % (",".join(["%s" % x for x in time + [m.time]]), dat)
                     data = "".join([chr(int(x, 16)) for x in re.split("[.!]", dat)])
                     return [[data, m.time, ul, m.level, freq]]
                 self.stat_fragments += 1
@@ -262,40 +426,48 @@ class ReassembleIDA(Reassemble):
             pass
         elif m.ctr == 0 and not m.cont:
             if verbose:
-                print(">single: [%s] %s" % (m.time, m.data))
+                print
+                ">single: [%s] %s" % (m.time, m.data)
             data = "".join([chr(int(x, 16)) for x in re.split("[.!]", m.data)])
             return [[data, m.time, m.ul, m.level, m.frequency]]
         elif m.ctr == 0 and m.cont:  # New long packet
             self.stat_fragments += 1
             if verbose:
-                print("initial: ", m.time, "(", m.cont, m.ctr, ")", m.data)
+                print
+                "initial: ", m.time, "(", m.cont, m.ctr, ")", m.data
             self.buf.append([m.frequency, [m.time], m.ctr, m.data, m.cont, m.ul])
         elif m.ctr > 0:
             self.stat_broken += 1
             self.stat_fragments += 1
             if verbose:
-                print("orphan: ", m.time, "(", m.cont, m.ctr, ")", m.data)
+                print
+                "orphan: ", m.time, "(", m.cont, m.ctr, ")", m.data
             pass
         else:
-            print("unknown: ", m.time, m.cont, m.ctr, m.data)
+            print
+            "unknown: ", m.time, m.cont, m.ctr, m.data
         # expire packets
         for (idx, (freq, time, ctr, dat, cont, ul)) in enumerate(self.buf[:]):
             if time[-1] + 1000 <= m.time:
                 self.stat_broken += 1
                 del self.buf[idx]
                 if verbose:
-                    print("timeout:", time, "(", cont, ctr, ")", dat)
+                    print
+                    "timeout:", time, "(", cont, ctr, ")", dat
                 data = "".join([chr(int(x, 16)) for x in re.split("[.!]", dat)])
                 # could be put into assembled if long enough to be interesting?
                 break
 
     def end(self):
         super(ReassembleIDA, self).end()
-        print("%d valid packets assembled from %d fragments (1:%1.2f)." % (
-            self.stat_ok, self.stat_fragments, ((float)(self.stat_fragments) / self.stat_ok)))
-        print("%d/%d (%3.1f%%) broken fragments." % (
-            self.stat_broken, self.stat_fragments, (100.0 * self.stat_broken / self.stat_fragments)))
-        print("%d dupes removed." % (self.stat_dupes))
+        print
+        "%d valid packets assembled from %d fragments (1:%1.2f)." % (
+            self.stat_ok, self.stat_fragments, ((float)(self.stat_fragments) / self.stat_ok))
+        print
+        "%d/%d (%3.1f%%) broken fragments." % (
+            self.stat_broken, self.stat_fragments, (100.0 * self.stat_broken / self.stat_fragments))
+        print
+        "%d dupes removed." % (self.stat_dupes)
 
     def consume(self, q):
         (data, time, ul, level, freq) = q
@@ -305,11 +477,170 @@ class ReassembleIDA(Reassemble):
             ul = "DL"
         str = ""
         for c in data:
-            if ord(c) >= 32 and ord(c) < 127:
+            if (ord(c) >= 32 and ord(c) < 127):
                 str += c
             else:
                 str += "."
-        print("%15.6f %s %s | %s" % (time, ul, " ".join("%02x" % ord(x) for x in data), str), file=outfile)
+
+        fbase = freq - base_freq
+        fchan = int(fbase / channel_width)
+        foff = fbase % channel_width
+        freq_print = "%3d|%05d" % (fchan, foff)
+
+        print("%15.6f %s %s %s | %s" % (time, freq_print, ul, " ".join("%02x" % ord(x) for x in data), str),
+              file=outfile)
+
+
+class ReassembleIDAPP(ReassembleIDA):
+    def consume(self, q):
+        (data, time, ul, _, freq) = q
+        if len(data) <= 2:
+            return
+
+        fbase = freq - base_freq
+        fchan = int(fbase / channel_width)
+        foff = fbase % channel_width
+        freq_print = "%3d|%05d" % (fchan, foff)
+
+        if ul:
+            ul = "UL"
+        else:
+            ul = "DL"
+
+        tmaj = "%02x" % (ord(data[0]))
+        tmin = "%02x%02x" % (ord(data[0]), ord(data[1]))
+        data = data[2:]
+        majmap = {
+            "03": "CC",
+            "05": "MM",
+            "06": "06",
+            "08": "08",
+            "09": "SMS",
+            "76": "SBD",
+        }
+        minmap = {
+            "0305": "Setup",
+            "030f": "Connect Acknowledge",
+            "0325": "Disconnect",
+            "032a": "Release Complete",
+            "032d": "Release",
+            "0502": "Location Updating Accept",
+            "0504": "Location Updating Reject",
+            "0508": "Location Updating Request",
+            "0512": "Authentication Request",
+            "0514": "Authentication Response",
+            "0518": "Identity request",
+            "0519": "Identity response",
+            "051a": "TMSI Reallocation Command",
+            "0600": "Register/Hello?",
+            "0901": "CP-DATA",
+            "0904": "CP-ACK",
+            "0910": "CP-ERROR",
+            "7605": "7605",
+            "7608": "downlink initial",
+            "7609": "downlink part#2",
+            "760a": "downlink part#3+",
+            "760c": "uplink initial",
+        }
+
+        if tmin in minmap:
+            tstr = "[" + majmap[tmaj] + ": " + minmap[tmin] + "]"
+        else:
+            if tmaj in majmap:
+                tstr = "[" + majmap[tmaj] + ": ?]"
+            else:
+                tstr = "[?]"
+
+        typ = tmin
+        print >> outfile, "%15.6f %s %s [%s] %-36s" % (time, freq_print, ul, typ, tstr),
+
+        if tmaj == "76" and int(typ[2:], 16) >= 8:
+            prehdr = ""
+            if typ == "7608":
+                # <26:44:9a:01:00:ba:85>
+                # 1: always? 26
+                # 2+3: sequence number (MTMSN)
+                # 4: number of packets in message
+                # 5: number of messages waiting to be delivered / backlog
+                # 6+7: unknown / maybe MOMSN?
+                prehdr = data[:7]
+                data = data[7:]
+                prehdr = "<" + ":".join("%02x" % ord(x) for x in prehdr) + ">"
+
+            # <10:87:01>
+            # 1: always 10
+            # 2: length in bytes of message
+            # 3: number of packet
+            hdr = data[:3]
+            data = data[3:]
+
+            hdr = "<" + ":".join("%02x" % ord(x) for x in hdr) + ">"
+
+            print >> outfile, "%-22s %-10s " % (prehdr, hdr),
+        # > 0600 / 10:13:f0:10: tmsi+lac+lac+00 +bytes
+        # < 0605 ?
+        # > 0508 Location Updating Request
+        #  < 0512 Authentication Request
+        #  > 0514 Authentication Response
+        #  < 051a TMSI reallocation command [09 f1 30](MCC/MNC/LAC) + [08 f4]TMSI
+        #  < 0518 Identity request 02: IMEI
+        #  > 0519 Identity response (IMEI)
+        # < 0502 Location Updating Accept (MCC/MNC/LAC)
+
+        # > 0600 / 20:13:f0:10: imei +bytes
+        # < 7608 <sbd_id> 0 messages
+        # > 760c <50:xx:xx> MOMSN echoback
+        # < 7605 ?
+        if typ == "0600":
+            hdr = data[:4]
+            data = data[4:]
+            print >> outfile, "[%s]" % (":".join("%02x" % ord(x) for x in hdr)),
+            imei = [ord(x) for x in data[:9]]
+            data = data[9:]
+            if ord(hdr[0]) == 0x20:
+                n1 = imei[1] >> 4
+                t = imei[1] & 0x7
+                o = (imei[1] >> 3) & 0x1
+                str = "%02x|%d_%x:%x" % (imei[0], o, t, n1)
+                str += "".join("%x%x" % ((x) & 0xf, (x) >> 4) for x in imei[2:])
+                imei = "[imei:" + str + "]"
+            elif ord(hdr[0]) == 0x10:
+                tmsi = "%02x%02x%02x%02x" % tuple(imei[:4])
+                str = "tmsi:%s" % tmsi
+                str += ",lac1:%02x%02x" % (imei[4], imei[5])
+                str += ",lac2:%02x%02x" % (imei[6], imei[7])
+                imei = "[" + str + ",%02x" % imei[8] + "]"
+            else:
+                imei = "[" + " ".join("%02x" % (x) for x in imei) + "]"
+            print >> outfile, "%s %s" % (imei, " ".join("%02x" % ord(x) for x in data))
+            return
+        if typ == "0519":  # Identity Resp.
+            imei = [ord(x) for x in data[:9]]
+            data = data[9:]
+            n1 = imei[1] >> 4
+            t = imei[1] & 0x7
+            o = (imei[1] >> 3) & 0x1
+            str = "%02x|%d_%x:%x" % (imei[0], o, t, n1)
+            str += "".join("%x%x" % ((x) & 0xf, (x) >> 4) for x in imei[2:])
+            if t == 2:
+                imei = "[imei:" + str + "]"
+            else:
+                imei = "[unknown:" + str + "]"
+            print >> outfile, "%s %s" % (imei, " ".join("%02x" % ord(x) for x in data))
+            return
+
+        if len(data) > 0:
+            print >> outfile, "%s" % (" ".join("%02x" % ord(x) for x in data)),
+
+            str = ""
+            for c in data:
+                if (ord(c) >= 32 and ord(c) < 127):
+                    str += c
+                else:
+                    str += "."
+            print >> outfile, " | %s" % (str)
+        else:
+            print >> outfile, ""
 
 
 class ReassembleIDASBD(ReassembleIDA):
@@ -360,7 +691,7 @@ class ReassembleIDASBD(ReassembleIDA):
 
         str = ""
         for c in data:
-            if ord(c) >= 32 and ord(c) < 127:
+            if (ord(c) >= 32 and ord(c) < 127):
                 str += c
             elif ord(c) > 127 + 32 and ord(c) < 255:
                 str += chr(ord(c) - 128)
@@ -370,9 +701,9 @@ class ReassembleIDASBD(ReassembleIDA):
         append = "| " + " ".join("%02x" % ord(x) for x in data)
         #        append=""
 
-        print("%s %s [%s] {%02x} %-22s %-10s %-200s %s" % (
+        print >> outfile, "%s %s [%s] {%02x} %-22s %-10s %-200s %s" % (
             datetime.datetime.fromtimestamp(time).strftime("%Y-%m-%dT%H:%M:%S"), ul, typ, len(data), prehdr,
-            "<" + hdr + ">", str, append), file=outfile)
+            "<" + hdr + ">", str, append)
 
 
 class ReassembleIDALAP(ReassembleIDA):
@@ -391,6 +722,10 @@ class ReassembleIDALAP(ReassembleIDA):
         if olvl < -126:
             olvl = -126
 
+        fbase = freq - base_freq
+        fchan = int(fbase / channel_width)
+        foff = fbase % channel_width
+
         # GSMTAP:
         #
         # struct gsmtap_hdr {
@@ -403,15 +738,15 @@ class ReassembleIDALAP(ReassembleIDA):
         #        int8_t signal_dbm;      /* signal level in dBm */                 olvl
         #        int8_t snr_db;          /* signal/noise ratio in dB */            0 ?
         #        uint32_t frame_number;  /* GSM Frame Number (FN) */               freq??
-        #        uint8_t sub_type;       /* Type of burst/channel, see above */    7
+        #        uint8_t sub_type;       /* Type of burst/channel, see above */    1 (BCCH) / 7 (?)
         #        uint8_t antenna_nr;     /* Antenna Number */                      0 ?
         #        uint8_t sub_slot;       /* sub-slot within timeslot */            0 ?
         #        uint8_t res;            /* reserved for future use (RFU) */       0 ?
         # } +attribute+((packed));
         if ul:
-            gsm = struct.pack("!BBBBHbBLBBBB", 2, 4, 2, 0, 0x4000, olvl, 0, freq, 1, 0, 0, 0) + lapdm
+            gsm = struct.pack("!BBBBHbBLBBBB", 2, 4, 2, 0, 0x4000 + fchan, olvl, 0, freq, 1, 0, 0, 0) + lapdm
         else:
-            gsm = struct.pack("!BBBBHbBLBBBB", 2, 4, 2, 0, 0x0000, olvl, 0, freq, 1, 0, 0, 0) + lapdm
+            gsm = struct.pack("!BBBBHbBLBBBB", 2, 4, 2, 0, 0x0000 + fchan, olvl, 0, freq, 1, 0, 0, 0) + lapdm
 
         return gsm
 
@@ -420,10 +755,12 @@ class ReassembleIDALAP(ReassembleIDA):
         if self.first:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.first = False
+            print
+            "Sending GSMTAP via UDP 4729"
 
-        (data, _, ul, _, _) = q
-        if ord(data[0]) & 0xf == 6 or ord(data[0]) & 0xf == 8 or (ord(data[0]) >> 8) == 7:
-            return
+        (data, time, ul, level, freq) = q
+        #        if ord(data[0])&0xf==6 or ord(data[0])&0xf==8 or (ord(data[0])>>8)==7:
+        #            return
         if len(data) == 1:
             return
         pkt = self.gsmwrap(q)
@@ -434,7 +771,8 @@ class ReassembleIDALAP(ReassembleIDA):
                 ul = "UL"
             else:
                 ul = "DL"
-            print("%15.6f %.3f %s %s" % (time, level, ul, ".".join("%02x" % ord(x) for x in data)))
+            print
+            "%15.6f %.3f %s %s" % (time, level, ul, ".".join("%02x" % ord(x) for x in data))
 
 
 class ReassembleIDALAPPCAP(ReassembleIDALAP):
@@ -460,10 +798,13 @@ class ReassembleIDALAPPCAP(ReassembleIDALAP):
 
         # Filter non-GSM packets (see IDA-GSM.txt)
         (data, time, ul, _, _) = q
-        if ord(data[0]) & 0xf == 6 or ord(data[0]) & 0xf == 8 or (ord(data[0]) >> 8) == 7:
-            return
-        if len(data) == 1:
-            return
+        if 'all' in args:
+            pass
+        else:
+            if ord(data[0]) & 0xf == 6 or ord(data[0]) & 0xf == 8 or (ord(data[0]) >> 8) == 7:
+                return
+            if len(data) == 1:
+                return
         gsm = self.gsmwrap(q)
         udp = struct.pack("!HHHH", 45988, 4729, 8 + len(gsm), 0xffff) + gsm  # 4729 == GSMTAP
 
@@ -493,26 +834,30 @@ class ReassembleIRA(Reassemble):
         q = super(ReassembleIRA, self).filter(line)
         if q == None: return None
         if q.typ == "IRA:":
-            p = re.compile('.*sat:(\d+) beam:(\d+) pos=\((.[0-9.]+)/(.[0-9.]+)\) alt=([-0-9]+) .* bc_sb:\d+ (.*)')
-            m = p.match(q.data)
+            p = re.compile(
+                'sat:(\d+) beam:(\d+) (?:aps=\S+ )?pos=\(([+-][0-9.]+)/([+-][0-9.]+)\) alt=(-?[0-9]+) .* bc_sb:\d+(?: (.*))?')
+            m = p.search(q.data)
             if (not m):
-                print("Couldn't parse IRA: ", q.data, file=sys.stderr)
+                print >> sys.stderr, "Couldn't parse IRA: ", q.data,
             else:
                 q.sat = int(m.group(1))
                 q.beam = int(m.group(2))
                 q.lat = float(m.group(3))
                 q.lon = float(m.group(4))
                 q.alt = int(m.group(5))
-                p = re.compile('PAGE\(tmsi:([0-9a-f]+) msc_id:([0-9]+)\)')
-                q.pages = p.findall(m.group(6))
+                if m.group(6) is not None:
+                    p = re.compile('PAGE\(tmsi:([0-9a-f]+) msc_id:([0-9]+)\)')
+                    q.pages = p.findall(m.group(6))
+                else:  # Won't be printed, but just in case
+                    q.pages = []
                 return q
 
     def process(self, q):
         for x in q.pages:
-            return ["%02d %02d %s %s %03d : %s %s" % (q.sat, q.beam, q.lat, q.lon, q.alt, x[0], x[1])]
+            return ["%03d %02d %6.2f %6.2f %03d : %s %s" % (q.sat, q.beam, q.lat, q.lon, q.alt, x[0], x[1])]
 
     def consume(self, q):
-        print(q, file=outfile)
+        print >> outfile, q
 
 
 class ReassembleMSG(Reassemble):
@@ -528,7 +873,7 @@ class ReassembleMSG(Reassemble):
                 '.* ric:(\d+) fmt:(\d+) seq:(\d+) [01]+ (\d)/(\d) csum:([0-9a-f][0-9a-f]) msg:([0-9a-f]+)\.([01]*) ')
             m = p.match(q.data)
             if (not m):
-                print("Couldn't parse MSG: ", q.data, file=sys.steerr)
+                print >> sys.stderr, "Couldn't parse MSG: ", q.data
             else:
                 q.msg_ric = int(m.group(1))
                 q.fmt = int(m.group(2))
@@ -538,7 +883,7 @@ class ReassembleMSG(Reassemble):
                 q.msg_checksum = int(m.group(6), 16)
                 q.msg_hex = m.group(7)
                 q.msg_brest = m.group(8)
-                q.time = q.fixtime()
+                q.enrich()
 
                 q.msg_msgdata = ''.join(
                     ["{0:08b}".format(int(q.msg_hex[i:i + 2], 16)) for i in range(0, len(q.msg_hex), 2)])
@@ -580,8 +925,9 @@ class ReassembleMSG(Reassemble):
         ts = m.time
         if id in self.buf:
             if self.buf[id].msg_checksum != m.msg_checksum:
-                print("Whoa! Checksum changed? Message %s (1: @%d checksum %d/2: @%d checksum %d)" % (
-                    id, self.buf[id].time, self.buf[id].msg_checksum, m.time, m.msg_checksum))
+                print
+                "Whoa! Checksum changed? Message %s (1: @%d checksum %d/2: @%d checksum %d)" % (
+                    id, self.buf[id].time, self.buf[id].msg_checksum, m.time, m.msg_checksum)
                 # "Wrap around" to not miss the changed packet.
                 self.ricseq[m.msg_ric][0] += 62
                 id = "%07d %04d" % (m.msg_ric, (m.msg_seq + self.ricseq[m.msg_ric][0]))
@@ -599,7 +945,8 @@ class ReassembleMSG(Reassemble):
         return (~csum) % 128
 
     def consume(self, q):
-        print("consume()")
+        print
+        "consume()"
         pass
 
     def end(self):  # XXX should be rewritten to consume
@@ -614,27 +961,41 @@ class ReassembleMSG(Reassemble):
             str += " %3d" % self.buf[b].msg_checksum
             str += (" fail", " OK  ")[self.buf[b].msg_checksum == csum]
             str += ": %s" % (msg)
-            print(str, file=outfile)
+            print >> outfile, str
 
 
+validargs = ()
 zx = None
 
 if mode == "ida":
     zx = ReassembleIDA()
-if mode == "gsmtap":
+elif mode == "idapp":
+    zx = ReassembleIDAPP()
+elif mode == "gsmtap":
     zx = ReassembleIDALAP()
 elif mode == "lap":
+    validargs = ('all')
     if outfile == sys.stdout:  # Force file, since it's binary
         ofile = "%s.%s" % (basename, "pcap")
         outfile = open(ofile, "w")
     zx = ReassembleIDALAPPCAP()
-if mode == "sbd":
+elif mode == "sbd":
     zx = ReassembleIDASBD()
 elif mode == "page":
     zx = ReassembleIRA()
 elif mode == "msg":
     zx = ReassembleMSG()
+elif mode == "stats":
+    validargs = ('perfect', 'state')
+    zx = StatsPKT()
 elif mode == "ppm":
     zx = ReassemblePPM()
+else:
+    print >> sys.stderr, "Unknown mode selected"
+    sys.exit(1)
+
+for x in args.keys():
+    if x not in validargs:
+        raise Exception("unknown -a option: " + x)
 
 zx.run(fileinput.input(ifile))

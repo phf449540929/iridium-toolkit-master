@@ -108,15 +108,15 @@ def nrepair(a,b): # "repair" two bit errors by brute force.
         return (0,b)
     blen=len(b)
     bnum=int(b,2)
-    for b1 in xrange(len(b)):
+    for b1 in range(len(b)):
         bnum1=bnum^(1<<b1)
         r=nndivide(a,bnum1)
         if(r==0):
             bnum1str=("{0:0%db}"%blen).format(bnum1)
             return (1,bnum1str)
-    for b1 in xrange(len(b)):
+    for b1 in range(len(b)):
         bnum1=bnum^(1<<b1)
-        for b2 in xrange(b1+1,len(b)):
+        for b2 in range(b1+1,len(b)):
             bnum2=bnum1^(1<<b2)
             r=nndivide(a,bnum2)
             if(r==0):

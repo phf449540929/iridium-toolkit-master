@@ -9,7 +9,6 @@ def listify(v):
 def stringify(v):
     return "".join([str(x) for x in v])
 
-
 debug=0
 
 #define POLYA   0x6d
@@ -26,7 +25,6 @@ def set_poly(pa,pb):
         print("set_poly: Poly length not equal")
         exit(-1)
 
-
 initbb= listify('0000000') # "bit buffer" :-)
 def set_initbb(list):
     global initbb
@@ -34,7 +32,6 @@ def set_initbb(list):
     if len(initbb)!=len(p1):
         print("intibb: Length needs to be ", len(p1))
         exit(-1)
-
 
 def fec(bits):
     out=[]

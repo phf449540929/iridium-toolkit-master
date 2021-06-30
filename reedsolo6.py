@@ -75,7 +75,7 @@ but I'm only testing on 2.5 - 3.2.
 
     To decode:
     >> mes, ecc = rs_correct_msg(mes + ecc, n-k, erase_pos=erase_pos)
-
+    
     If the decoding fails, it will normally automatically check and raise a ReedSolomonError exception that you can handle.
     However if you want to manually check if the repaired message is correct, you can do so:
     >> rsman.check(rmes + recc, k=k)
@@ -115,7 +115,8 @@ class ReedSolomonError(Exception):
     pass
 
 
-gf_exp = bytearray([1] * 512)  # For efficiency, gf_exp[] has size 2*GF_SIZE, so that a simple multiplication of two numbers can be resolved without calling % 255. For more infos on how to generate this extended exponentiation table, see paper: "Fast software implementation of finite field operations", Cheng Huang and Lihao Xu, Washington University in St. Louis, Tech. Rep (2003).
+gf_exp = bytearray([
+                       1] * 512)  # For efficiency, gf_exp[] has size 2*GF_SIZE, so that a simple multiplication of two numbers can be resolved without calling % 255. For more infos on how to generate this extended exponentiation table, see paper: "Fast software implementation of finite field operations", Cheng Huang and Lihao Xu, Washington University in St. Louis, Tech. Rep (2003).
 gf_log = bytearray(256)
 field_charac = int(2 ** 8 - 1)
 
@@ -609,7 +610,7 @@ def rs_find_error_locator(synd, nsym, erase_loc=None, erase_count=0):
                     delta))  # effectively we are doing err_loc * 1/delta = err_loc // delta
                 err_loc = new_loc
                 # Update the update flag
-                # L = K - L # the update flag L is tricky: in Blahut's schema, it's mandatory to use `L = K - L - erase_count` (and indeed in a previous draft of this function, if you forgot to do `- erase_count` it would lead to correcting only 2*(errors+erasures) <= (n-k) instead of 2*errors+erasures <= (n-k)), but in this latest draft, this will lead to a wrong decoding in some cases where it should correctly decode! Thus you should try with and without `- erase_count` to update L on your own implementation and see which one works OK without producing wrong decoding failures.
+            # L = K - L # the update flag L is tricky: in Blahut's schema, it's mandatory to use `L = K - L - erase_count` (and indeed in a previous draft of this function, if you forgot to do `- erase_count` it would lead to correcting only 2*(errors+erasures) <= (n-k) instead of 2*errors+erasures <= (n-k)), but in this latest draft, this will lead to a wrong decoding in some cases where it should correctly decode! Thus you should try with and without `- erase_count` to update L on your own implementation and see which one works OK without producing wrong decoding failures.
 
             # Update with the discrepancy
             err_loc = gf_poly_add(err_loc, gf_poly_scale(old_loc, delta))
@@ -724,8 +725,13 @@ def rs_correct_msg(msg_in, nsym, fcr=0, generator=2, erase_pos=None, only_erasur
 
     # Find errors values and apply them to correct the message
     # compute errata evaluator and errata magnitude polynomials, then correct errors and erasures
-    msg_out = rs_correct_errata(msg_out, synd, (erase_pos + err_pos), fcr,
-                                generator)  # note that we here use the original syndrome, not the forney syndrome (because we will correct both errors and erasures, so we need the full syndrome)
+    msg_out = rs_correct_errata(msg_out, synd, list(list(erase_pos) + list(err_pos)), fcr, generator)
+    # msg_out = rs_correct_errata(msg_out, synd, (erase_pos + err_pos), fcr, generator)
+    '''
+    python2中，range()返回的是list，可以将两个range()直接相加，如range(5)+range(10)
+    python3中，range()成了一个class，不可以直接将两个range()直接相加，需要先加个list,如list(range(5))+list(range(10))
+    '''
+    # note that we here use the original syndrome, not the forney syndrome (because we will correct both errors and erasures, so we need the full syndrome)
     # check if the final message is fully repaired
     synd = rs_calc_syndromes(msg_out, nsym, fcr, generator)
     if max(synd) > 0:

@@ -1,0 +1,3 @@
+#bin/sh
+python3 iridium-parser.py output01.bits > output01.parsed
+python3 stats-voc.py output01.parsed

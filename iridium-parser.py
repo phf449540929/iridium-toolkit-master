@@ -4,20 +4,24 @@ from __future__ import print_function
 import sys
 import re
 import struct
-from bch import ndivide, nrepair, bch_repair
-import crcmod
-import rs
-import rs6
 import fileinput
 import getopt
 import types
-import copy
 import datetime
 import collections
+import math
+
+import bch
+import crcmod
+import rs
+import rs6
 
 izip = zip
-# from itertools import zip
-from math import sqrt, atan2, pi
+# from itertools import izip
+'''
+in python2 is izip which in itertools
+in python3 is zip which is inherent from python
+'''
 
 options, remainder = getopt.getopt(sys.argv[1:], 'vgi:o:pes', [
     'verbose',
@@ -46,6 +50,10 @@ iridium_access = "001100000011000011110011"  # Actually 0x789h in BPSK
 uplink_access = "110011000011110011111100"  # BPSK: 0xc4b
 UW_DOWNLINK = [0, 2, 2, 2, 2, 0, 0, 0, 2, 0, 0, 2]
 UW_UPLINK = [2, 2, 0, 0, 0, 2, 0, 0, 2, 0, 2, 2]
+'''
+iridium_access is UW_DOWNLINK in BPSK symbol
+uplink_access is UW_UPLINK in BPSK symbol
+'''
 iridium_lead_out = "100101111010110110110011001111"
 header_messaging = "00110011111100110011001111110011"  # 0x9669 in BPSK
 header_time_location = "11" + "0" * 94
@@ -166,10 +174,12 @@ maxts = 0
 
 def fmt_iritime(iritime):
     # Different Iridium epochs that we know about:
-    # 2014-05-11T14:23:55Z : 1399818235 current one
-    # 2007-03-08T03:50:21Z : 1173325821
-    # 1996-06-01T00:00:11Z :  833587211 the original one
+    # ERA2: 2014-05-11T14:23:55Z : 1399818235 active since 2015-03-03T18:00:00Z
+    # ERA1: 2007-03-08T03:50:21Z : 1173325821
+    #       1996-06-01T00:00:11Z :  833587211 the original one (~1997-05-05)
     uxtime = float(iritime) * 90 / 1000 + 1399818235
+    if uxtime > 1435708799: uxtime -= 1  # Leap second: 2015-06-30 23:59:59
+    if uxtime > 1483228799: uxtime -= 1  # Leap second: 2016-12-31 23:59:59
     strtime = datetime.datetime.fromtimestamp(uxtime, tz=Z).strftime(
         "%Y-%m-%dT%H:%M:%S.{:02.0f}Z".format((uxtime % 1) * 100))
     return (uxtime, strtime)
@@ -367,10 +377,10 @@ class IridiumMessage(Message):
             hdrlen = 6
             blocklen = 64
             if len(data) > hdrlen + blocklen:
-                if ndivide(hdr_poly, data[:hdrlen]) == 0:
+                if bch.ndivide(hdr_poly, data[:hdrlen]) == 0:
                     (o_bc1, o_bc2) = de_interleave(data[hdrlen:hdrlen + blocklen])
-                    if ndivide(ringalert_bch_poly, o_bc1[:31]) == 0:
-                        if ndivide(ringalert_bch_poly, o_bc2[:31]) == 0:
+                    if bch.ndivide(ringalert_bch_poly, o_bc1[:31]) == 0:
+                        if bch.ndivide(ringalert_bch_poly, o_bc2[:31]) == 0:
                             self.msgtype = "BC"
 
         if "msgtype" not in self.__dict__ and linefilter['type'] == "IridiumBCMessage":
@@ -380,11 +390,11 @@ class IridiumMessage(Message):
         if "msgtype" not in self.__dict__:
             if len(data) > 64:  # XXX: heuristic based on LCW / first BCH block, can we do better?
                 (o_lcw1, o_lcw2, o_lcw3) = de_interleave_lcw(data[:46])
-                if ndivide(29, o_lcw1) == 0:
-                    if ndivide(41, o_lcw3) == 0:
-                        (e2, lcw2, bch) = bch_repair(465, o_lcw2 + '0')  # One bit missing, so we guess
+                if bch.ndivide(29, o_lcw1) == 0:
+                    if bch.ndivide(41, o_lcw3) == 0:
+                        (e2, lcw2, bchs) = bch.bch_repair(465, o_lcw2 + '0')  # One bit missing, so we guess
                         if (e2 == 1):  # Maybe the other one...
-                            (e2, lcw2, bch) = bch_repair(465, o_lcw2 + '1')
+                            (e2, lcw2, bchs) = bch.bch_repair(465, o_lcw2 + '1')
                         if e2 == 0:
                             self.msgtype = "LW"
 
@@ -396,9 +406,9 @@ class IridiumMessage(Message):
             firstlen = 3 * 32
             if len(data) >= 3 * 32:
                 (o_ra1, o_ra2, o_ra3) = de_interleave3(data[:firstlen])
-                if ndivide(ringalert_bch_poly, o_ra1[:31]) == 0:
-                    if ndivide(ringalert_bch_poly, o_ra2[:31]) == 0:
-                        if ndivide(ringalert_bch_poly, o_ra3[:31]) == 0:
+                if bch.ndivide(ringalert_bch_poly, o_ra1[:31]) == 0:
+                    if bch.ndivide(ringalert_bch_poly, o_ra2[:31]) == 0:
+                        if bch.ndivide(ringalert_bch_poly, o_ra3[:31]) == 0:
                             self.msgtype = "RA"
 
         if "msgtype" not in self.__dict__ and linefilter['type'] == "IridiumRAMessage":
@@ -407,14 +417,17 @@ class IridiumMessage(Message):
 
         if "msgtype" not in self.__dict__:
             if harder:
+                '''
+                harder is default false
+                '''
                 # try IBC
                 if len(data) >= 70:
                     hdrlen = 6
                     blocklen = 64
-                    (e1, _, _) = bch_repair(hdr_poly, data[:hdrlen])
+                    (e1, _, _) = bch.bch_repair(hdr_poly, data[:hdrlen])
                     (o_bc1, o_bc2) = de_interleave(data[hdrlen:hdrlen + blocklen])
-                    (e2, d2, b2) = bch_repair(ringalert_bch_poly, o_bc1[:31])
-                    (e3, d3, b3) = bch_repair(ringalert_bch_poly, o_bc2[:31])
+                    (e2, d2, b2) = bch.bch_repair(ringalert_bch_poly, o_bc1[:31])
+                    (e3, d3, b3) = bch.bch_repair(ringalert_bch_poly, o_bc2[:31])
                     if e1 >= 0 and e2 >= 0 and e3 >= 0:
                         if ((d2 + b2 + o_bc1[31]).count('1') % 2) == 0:
                             if ((d3 + b3 + o_bc2[31]).count('1') % 2) == 0:
@@ -423,10 +436,10 @@ class IridiumMessage(Message):
                 # try for LCW
                 if len(data) >= 64:
                     (o_lcw1, o_lcw2, o_lcw3) = de_interleave_lcw(data[:46])
-                    (e1, lcw1, bch) = bch_repair(29, o_lcw1)  # BCH(7,3)
-                    (e2a, lcw2, bch) = bch_repair(465, o_lcw2 + '0')  # BCH(13,16)
-                    (e2b, lcw2, bch) = bch_repair(465, o_lcw2 + '1')
-                    (e3, lcw3, bch) = bch_repair(41, o_lcw3)  # BCH(26,21)
+                    (e1, lcw1, bchs) = bch.bch_repair(29, o_lcw1)  # BCH(7,3)
+                    (e2a, lcw2, bchs) = bch.bch_repair(465, o_lcw2 + '0')  # BCH(13,16)
+                    (e2b, lcw2, bchs) = bch.bch_repair(465, o_lcw2 + '1')
+                    (e3, lcw3, bchs) = bch.bch_repair(41, o_lcw3)  # BCH(26,21)
 
                     e2 = e2a
                     if (e2b >= 0 and e2b < e2a) or (e2a < 0):
@@ -470,7 +483,7 @@ class IridiumMessage(Message):
         elif self.msgtype == "BC":
             hdrlen = 6
             self.header = data[:hdrlen]
-            (e, d, bch) = bch_repair(hdr_poly, self.header)
+            (e, d, bchs) = bch.bch_repair(hdr_poly, self.header)
 
             self.bc_type = int(d, 2)
             if e == 0:
@@ -486,9 +499,9 @@ class IridiumMessage(Message):
         elif self.msgtype == "LW":
             lcwlen = 46
             (o_lcw1, o_lcw2, o_lcw3) = de_interleave_lcw(data[:lcwlen])
-            (e1, self.lcw1, bch) = bch_repair(29, o_lcw1)
-            (e2a, lcw2a, bch) = bch_repair(465, o_lcw2 + '0')  # One bit error expected
-            (e2b, lcw2b, bch) = bch_repair(465, o_lcw2 + '1')  # Other bit flip?
+            (e1, self.lcw1, bchs) = bch.bch_repair(29, o_lcw1)
+            (e2a, lcw2a, bchs) = bch.bch_repair(465, o_lcw2 + '0')  # One bit error expected
+            (e2b, lcw2b, bchs) = bch.bch_repair(465, o_lcw2 + '1')  # Other bit flip?
             if e2b < 0:
                 e2 = e2a
                 self.lcw2 = lcw2a
@@ -501,16 +514,17 @@ class IridiumMessage(Message):
             else:
                 e2 = e2b
                 self.lcw2 = lcw2b
-            (e3, self.lcw3, bch) = bch_repair(41, o_lcw3)
+            (e3, self.lcw3, bchs) = bch.bch_repair(41, o_lcw3)
             self.ft = int(self.lcw1, 2)  # Frame type
             if forcetype and ':' in forcetype:
                 self.ft = int(forcetype.partition(':')[2])
             if e1 < 0 or e2 < 0 or e3 < 0:
                 self._new_error("LCW decode failed")
                 self.header = "LCW(%s %s/%02d E%d,%s %sx/%03d E%d,%s %s/%02d E%d)" % (
-                    o_lcw1[:3], o_lcw1[3:], ndivide(29, o_lcw1), e1, o_lcw2[:6], o_lcw2[6:], ndivide(465, o_lcw2 + '0'),
+                    o_lcw1[:3], o_lcw1[3:], bch.ndivide(29, o_lcw1), e1, o_lcw2[:6], o_lcw2[6:],
+                    bch.ndivide(465, o_lcw2 + '0'),
                     e2,
-                    o_lcw3[:21], o_lcw3[21:], ndivide(41, o_lcw3), e3)
+                    o_lcw3[:21], o_lcw3[21:], bch.ndivide(41, o_lcw3), e3)
             else:
                 # LCW:=xx[type] yyyy[code]
                 # 0: maint
@@ -899,6 +913,11 @@ class IridiumVOMessage(IridiumMessage):
                 str += " RS=ok"
             str += " " + group(v, 6)
         else:
+            '''
+            %02x
+            x 表示以十六进制形式输出
+            02 表示不足两位,，前面补0输出，如果超过两位，则以实际输出
+            '''
             str += " [" + ".".join(["%02x" % x for x in self.vdata]) + "]"
         str += self._pretty_trailer()
         return str
@@ -906,6 +925,9 @@ class IridiumVOMessage(IridiumMessage):
 
 # Poly from GSM 04.64 / check value (reversed) is 0xC91B6
 iip_crc24 = crcmod.mkCrcFun(poly=0x1BBA1B5, initCrc=0xffffff ^ 0x0c91b6, rev=True, xorOut=0x0c91b6)
+'''
+poly is the polynomial
+'''
 
 
 class IridiumIPMessage(IridiumMessage):
@@ -1011,13 +1033,13 @@ class IridiumECCMessage(IridiumMessage):
             if len(block) != 31:
                 raise ParserError("unknown BCH block len:%d" % len(block))
 
-            (errs, data, bch) = bch_repair(self.poly, block)
+            (errs, data, bchs) = bch.bch_repair(self.poly, block)
             if (errs < 0):
                 if len(self.bitstream_bch) == 0: self._new_error("BCH decode failed")
                 break
 
             if parity:
-                if ((data + bch + parity).count('1') % 2) == 1:
+                if ((data + bchs + parity).count('1') % 2) == 1:
                     if len(self.bitstream_bch) == 0: self._new_error("Parity error")
                     break
 
@@ -1060,13 +1082,13 @@ class IridiumECCMessage(IridiumMessage):
         for block in xrange(len(self.descrambled)):
             b = self.descrambled[block]
             if len(b) == 31:
-                (errs, foo) = nrepair(self.poly, b)
-                res = ndivide(self.poly, b)
+                (errs, foo) = bch.nrepair(self.poly, b)
+                res = bch.ndivide(self.poly, b)
                 parity = (foo).count('1') % 2
                 str += "{%s %s/%04d E%s P%d}" % (b[:21], b[21:31], res, ("0", "1", "2", "-")[errs], parity)
             elif len(b) == 32:
-                (errs, foo) = nrepair(self.poly, b[:31])
-                res = ndivide(self.poly, b[:31])
+                (errs, foo) = bch.nrepair(self.poly, b[:31])
+                res = bch.ndivide(self.poly, b[:31])
                 parity = (foo + b[31]).count('1') % 2
                 str += "{%s %s %s/%04d E%s P%d}" % (b[:21], b[21:31], b[31], res, ("0", "1", "2", "-")[errs], parity)
             else:
@@ -1291,9 +1313,13 @@ class IridiumRAMessage(IridiumECCMessage):
         self.ra_eip = int(self.bitstream_bch[57:58], 2)  # EPI ?
         self.ra_bc_sb = int(self.bitstream_bch[58:63], 2)  # BCH downlink sub-band
 
-        self.ra_lat = atan2(self.ra_pos_z, sqrt(self.ra_pos_x ** 2 + self.ra_pos_y ** 2)) * 180 / pi
-        self.ra_lon = atan2(self.ra_pos_y, self.ra_pos_x) * 180 / pi
-        self.ra_alt = sqrt(self.ra_pos_x ** 2 + self.ra_pos_y ** 2 + self.ra_pos_z ** 2) * 4
+        '''
+        Math.atan2(y,x)
+        返回从原点(0,0)到(x,y)点的线段与x轴正方向之间的平面角度(弧度值)
+        '''
+        self.ra_lat = math.atan2(self.ra_pos_z, math.sqrt(self.ra_pos_x ** 2 + self.ra_pos_y ** 2)) * 180 / math.pi
+        self.ra_lon = math.atan2(self.ra_pos_y, self.ra_pos_x) * 180 / math.pi
+        self.ra_alt = math.sqrt(self.ra_pos_x ** 2 + self.ra_pos_y ** 2 + self.ra_pos_z ** 2) * 4
         self.ra_msg = False
         ra_msg = self.bitstream_bch[63:]
 
@@ -1598,14 +1624,14 @@ def grouped(iterable, n):
 
 def symbol_reverse(bits):
     r = ''
-    for x in xrange(0, len(bits) - 1, 2):
+    for x in range(0, len(bits) - 1, 2):
         r += bits[x + 1] + bits[x + 0]
     return r
 
 
 def de_interleave(group):
     #    symbols = [''.join(symbol) for symbol in grouped(group, 2)]
-    symbols = [group[z + 1] + group[z] for z in xrange(0, len(group), 2)]
+    symbols = [group[z + 1] + group[z] for z in range(0, len(group), 2)]
     even = ''.join([symbols[x] for x in range(len(symbols) - 2, -1, -2)])
     odd = ''.join([symbols[x] for x in range(len(symbols) - 1, -1, -2)])
     return (odd, even)
@@ -1613,7 +1639,7 @@ def de_interleave(group):
 
 def de_interleave3(group):
     #    symbols = [''.join(symbol) for symbol in grouped(group, 2)]
-    symbols = [group[z + 1] + group[z] for z in xrange(0, len(group), 2)]
+    symbols = [group[z + 1] + group[z] for z in range(0, len(group), 2)]
     third = ''.join([symbols[x] for x in range(len(symbols) - 3, -1, -3)])
     second = ''.join([symbols[x] for x in range(len(symbols) - 2, -1, -3)])
     first = ''.join([symbols[x] for x in range(len(symbols) - 1, -1, -3)])
@@ -1662,7 +1688,7 @@ def slice_extra(string, n):
 
 
 def slice(string, n):
-    return [string[x:x + n] for x in xrange(0, len(string), n)]
+    return [string[x:x + n] for x in range(0, len(string), n)]
 
 
 if output == "dump":
@@ -1752,7 +1778,8 @@ def perline(q):
         if type(q).__name__ == "IridiumMessagingAscii" and not q.error:
             selected.append(q)
     elif output == "sat":
-        if not q.error and not q.oddbits == "1011":
+        # if not q.error and not q.oddbits == "1011":
+        if not q.error:
             selected.append(q)
     elif output == "dump":
         pickle.dump(q, file, 1)
@@ -1766,13 +1793,14 @@ def perline(q):
                 print(q.pretty())
             else:
                 q.globaltime = "%.6f" % (q.globaltime)
-                if ("iri_time_diff" in q.__dict__): q.iri_time_diff = "%.6f" % (q.iri_time_diff)
+                if ("iri_time_diff" in q.__dict__):
+                    q.iri_time_diff = "%.6f" % (q.iri_time_diff)
                 print(" ".join([str(q.__dict__[x]) for x in ofmt]))
     elif output == "rxstats":
         print("RX", "X", q.globaltime, q.frequency, "X", "X", q.confidence, q.level, q.symbols, q.error,
               type(q).__name__)
     else:
-        print("Unknown output mode.", file=sys.stderr)
+        print("Unknown output mode." + output, file=sys.stderr)
         exit(1)
 
 
@@ -1789,7 +1817,7 @@ if output == "sat":
         f = m.frequency
         t = m.globaltime
         no = -1
-        for s in xrange(len(sats)):
+        for s in range(len(sats)):
             fdiff = (sats[s][0] - f) / (t - sats[s][1])
             if f < sats[s][0] and fdiff < 250:
                 no = s
@@ -1802,7 +1830,7 @@ if output == "sat":
             sats.append([f, t])
             m.fdiff = 0
         m.satno = no
-    for s in xrange(len(sats)):
+    for s in range(len(sats)):
         print("Sat: %03d" % s)
         for m in selected:
             if m.satno == s: print(m.pretty())
@@ -1901,6 +1929,9 @@ if output == "plot":
     if plotargs[0] == "time":
         plotargs[0] = "globaltime"
 
+    if False:
+        plotsats(plt, selected[0].globaltime, selected[-1].globaltime)
+
     for m in selected:
         xl.append(m.__dict__[plotargs[0]])
         yl.append(m.__dict__[plotargs[1]])
@@ -1908,6 +1939,9 @@ if output == "plot":
             cl.append(m.__dict__[plotargs[2]])
 
     if len(plotargs) > 2:
+        '''
+        scatter散点图
+        '''
         plt.scatter(x=xl, y=yl, c=cl)
         plt.colorbar().set_label(plotargs[2])
     else:
