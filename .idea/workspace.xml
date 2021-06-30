@@ -1,9 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="ece0fd08-bde6-423a-bf9c-719320cdcf04" name="默认的" comment="">
-      <change beforePath="$PROJECT_DIR$/.github/workflows/irc-notify.yml" beforeDir="false" />
-    </list>
+    <list default="true" id="ece0fd08-bde6-423a-bf9c-719320cdcf04" name="默认的" comment="" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -103,6 +101,7 @@
       <workItem from="1624454879948" duration="977000" />
       <workItem from="1625034686742" duration="2145000" />
       <workItem from="1625037663176" duration="1885000" />
+      <workItem from="1625043596931" duration="301000" />
     </task>
     <servers />
   </component>
