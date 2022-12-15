@@ -61,7 +61,7 @@ def cut_convert_play(t_start, t_stop, f_min, f_max):
     for line in lines:
         f_out.write(line + "\n")
     f_out.close()
-    os.system("./play-iridium-ambe ./voice.bits")
+    os.system("play-iridium-ambe ./voice.bits")
 
 
 def onclick(event):

@@ -8,7 +8,7 @@ import fileinput
 import getopt
 import types
 import datetime
-import collections
+import collections.abc
 import math
 
 import bch
@@ -45,6 +45,27 @@ options, remainder = getopt.getopt(sys.argv[1:], 'vgi:o:pes', [
     'globaltime',
     'channelize',
 ])
+'''
+good: min_confidence = 90 /confidence in percent, signal with less confidence will be discarded
+uw-ec: it will make preamble back qbsk and undo differential decode, it allows 4 bits error but it only use in test
+harder: it will do a more bch test in lcw
+confidence: min_confidence = arg
+input: input = arg, raw/dump
+output: output = arg, line/dump/plot/err/msg/sat/rxstats
+perfect: show the number of error which was fixed 
+errorfree: discard the line which are error in it
+interesting: do not process some kinds of frame
+satclass: need a library, but i don't find
+plot: plotarg = arg,arg /the coordinate of the plot
+filter: linefilter = arg, type/attr/check
+voice-dump: make the voice frame to write in a dump file
+format: it will change the output in parsing, but the file don't provide the arg for it
+errorfile: point the file which the error would be output
+errorstats: statistic the errors
+forcetype: make the massage type in your input type, but the file don't provide the arg for it
+globaltime: change the time to globaltime
+channelize: calculate the channel is the which channel 
+'''
 
 iridium_access = "001100000011000011110011"  # Actually 0x789h in BPSK
 uplink_access = "110011000011110011111100"  # BPSK: 0xc4b
@@ -128,9 +149,9 @@ for opt, arg in options:
     elif opt in ('--channelize'):
         channelize = True
     elif opt in ('--format'):
-        ofmt = arg.split(',');
+        ofmt = arg.split(',')
     elif opt in ('--globaltime'):
-        globaltime = True;
+        globaltime = True
     else:
         raise Exception("unknown argument?")
 
@@ -1742,7 +1763,7 @@ def perline(q):
         if ("descrambled" in q.__dict__): del q.descrambled
         del q.descramble_extra
     if q.error:
-        if isinstance(errorstats, collections.Mapping):
+        if isinstance(errorstats, collections.abc.Mapping):
             msg = q.error_msg[0]
             if (msg in errorstats):
                 errorstats[msg] += 1
@@ -1835,7 +1856,7 @@ if output == "sat":
         for m in selected:
             if m.satno == s: print(m.pretty())
 
-if isinstance(errorstats, collections.Mapping):
+if isinstance(errorstats, collections.abc.Mapping):
     total = 0
     for (msg, count) in sorted(errorstats.iteritems()):
         total += count
